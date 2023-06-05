@@ -1,0 +1,1435 @@
+---
+title: "Preliminary analysis: NAT2 and propensity scores"
+author: "Gustavo"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    theme: paper
+    highlight: tango
+    number_sections: false
+    toc: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+library(tidyverse)
+library(WeightIt)
+library(survey)
+library(cobalt)
+library(readxl)
+library(sjPlot)
+library(logistf)
+library(kableExtra)
+library(compareGroups)
+```
+
+<style type="text/css">
+.main-container {
+  max-width: 1000px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+
+# Overall {.tabset} 
+
+<div id="quarterly-product" class="section level7">
+
+```{r}
+set.seed(1)
+
+path <- 'C:/Users/amorigg1/OneDrive - VUMC/Documents/RePORT/Digna/'
+dd <- read.csv(paste0(path, 'David_Hass/2022_7_10_REPORT_Brazil.csv')) %>%
+  dplyr::select(-afr, -ame, -eur)
+dd_extra_info <- read.csv(paste0(path, 'dataset_AE_DrugConc_1row_per_patient_v3.csv')) %>%
+  rename(afr = AFR,
+         eur = EUR,
+         ame = AME)
+
+dd_final <- dd %>%
+  left_join(dd_extra_info %>%
+              mutate(FID = toupper(subjid)) %>%
+              dplyr::select(FID, alcoholhx_bsl, smokhx_bsl, drughx_bsl,
+                            afr, eur, ame)) %>%
+  mutate(nat2_cat = dd$nat2_3lev,
+         sex = as.factor(sex),
+         hgapct_group = ifelse(is.na(lab_hgapct), NA,
+                               ifelse(lab_hgapct < 5.7, '5.7-',
+                                      ifelse(lab_hgapct < 6.4, '5.7-6.4', '6.5+')))) %>%
+  filter(!is.na(nat2_3lev) & tb_standard==1) %>%
+  filter(!is.na(afr)) %>%
+  filter(!is.na(dot_yesno) & !is.na(lab_hgapct) & !is.na(hiv)) %>%
+  mutate(nat2_cat = ifelse(nat2_3lev == 3, 'slow',
+                            ifelse(nat2_3lev == 2, 'intermediate', 'extensive')),
+         #nat2_cat = relevel(as.factor(nat2_cat), ref = 'extensive'),
+         nat2_cat = relevel(as.factor(nat2_cat), ref = 'extensive'),
+         nat2_bin = ifelse(nat2_3lev == 3, 1, 0), ## intermediate/extensive
+         alcoholhx_bsl = ifelse(is.na(alcoholhx_bsl), NA,
+                                ifelse(alcoholhx_bsl %in% 'never', 0, 1)),
+         alcoholhx_bsl = as.factor(alcoholhx_bsl),
+         smokhx_bsl = ifelse(is.na(smokhx_bsl), NA,
+                             ifelse(smokhx_bsl %in% 'never', 0, 1)),
+         smokhx_bsl = as.factor(smokhx_bsl),
+         drughx_bsl = ifelse(is.na(drughx_bsl), NA,
+                             ifelse(drughx_bsl %in% 'never', 0, 1)),
+         drughx_bsl = as.factor(drughx_bsl),
+         bmi = weight/(height/100)^2,
+         any_hepatic_all = 1*(any_hepatic_all == 1),
+         any_hepatic_relatedtb = 1*(any_hepatic_relatedtb == 1))
+
+outcomes <- c('ever_ae_all', 'ever_ae_relatedtb', 'ever_grade345_all', 'ever_grade345_relatedtb',
+              'ever_hepatic_all', 'ever_hepatic_all', 'ever_hepatic_relatedtb', 'fail_recur')
+exposure <- c('nat2_bin', 'nat2_cat')
+covariates_out <- c('hiv', 'age', 'sex', 'dot_yesno', 'lab_hgapct', 'afr', 'eur')
+covariates_out_v2 <- c('hiv', 'age', 'sex', 'afr', 'eur')
+covariates_ps  <- c('hiv', 'age', 'sex', 'dot_yesno', 'lab_hgapct', 'bmi',
+                    'alcoholhx_bsl', 'smokhx_bsl', 'drughx_bsl')
+```
+
+
+```{r}
+run_mod <- function(i, j, data, B = B, boots_ci = FALSE,
+                    outcomes, exposure,
+                    covariates_ps, covariates_out){
+  out_var <- outcomes[i]
+  exp_var <- exposure[j]
+  
+  out_eq  <- as.formula(paste0(out_var, ' ~ ', exp_var))
+  out_ps  <- as.formula(paste0(exp_var, ' ~ ', paste0(covariates_ps, collapse = ' + ')))
+  out_all <- as.formula(paste0(out_var, ' ~ ', paste0(c(exp_var, covariates_out), collapse = ' + ')))
+  
+  if (j == 1){
+    weights_ps <- weightit(out_ps, data = data)
+  } else {
+    weights_ps <- weightit(out_ps, data = data, estimand = "ATT", focal = levels(data[,exp_var])[1])
+  }
+  data$wts <- weights_ps$weights
+  
+  des  <- svydesign(id = ~NULL, data = data, weights = ~wts)
+  fit0 <- glm(out_eq, data = data, family = binomial)
+  fit1 <- svyglm(out_eq, design = des, family = binomial) 
+  fit2 <- glm(out_all, data = data, family = binomial)
+  fitwt <- logistf(out_eq, data=data, weights=wts)
+
+  fit1_coef <- fit2_coef <- NULL
+  if (boots_ci){
+    fit1_coef <- matrix(NA, ncol = j+1, nrow=B+1)
+    fit1_coef[1,] <- fit1$coefficients
+    
+    fit2_coef <- matrix(NA, ncol = j+1, nrow=B+1)
+    fit2_coef[1,] <- fitwt$coefficients
+    
+    ncases    <- sum(data[,out_var] & data[,exp_var]=='extensive')
+    ncontrols <- sum(data[,out_var]==0 | data[,exp_var]!='extensive')
+    for (b in 2:(B+1)){
+      data_temp <- data[sample(1:nrow(data), nrow(data), replace = TRUE),]
+#      samp_cases <- sample(which(data[,out_var]==1 & data[,exp_var]=='extensive'), ncases, replace = TRUE)
+#      if (length(which(data[,out_var]==1 & data[,exp_var]=='extensive')) == 1)
+#        samp_cases <- which(data[,out_var]==1 & data[,exp_var]=='extensive')
+#      samp_controls <- sample(which(data[,out_var]==0 | data[,exp_var]!='extensive'), ncontrols, replace = TRUE)
+#      data_temp <- data[c(samp_cases,samp_controls),]
+      des_temp  <- svydesign(id = ~NULL, data = data_temp, weights = ~wts)
+      fit1_coef[b,] <- svyglm(out_eq, design = des_temp, family = binomial)$coef
+      fit2_coef[b,] <- logistf(out_eq, data=data_temp, weights=wts)$coef
+    }
+    colnames(fit1_coef) <- names(fit1$coefficients)
+    colnames(fit2_coef) <- names(fitwt$coefficients)
+  }
+  
+  return(list(mod_all = fit2, mod_ps = fit1, mod_null = fit0, weights_ps = weights_ps, mod_firth = fitwt,
+              out_var = out_var, exp_var = exp_var, ps_wgts = weights_ps, fit1_coef_boots = fit1_coef, fit2_coef_boots = fit2_coef))
+}
+```
+
+```{r}
+summary_tab <- function(x) {
+  ci95 <- round(exp(confint.default(x)), 2)
+  data.frame(OR = round(exp(summary(x)$coef[,1]), 2),
+             CI = paste0('(', ci95[,1], ' ; ', ci95[,2], ')'),
+             p.value = round(summary(x)$coef[,4], 3)) %>%
+  kable() %>% kable_styling()
+}
+
+summary_tab_profile <- function(x) {
+  ci95 <- round(exp(confint(x)), 2)
+  ci95 <- round(exp(confint(x)), 2)
+  data.frame(OR = round(exp(summary(x)$coef[,1]), 2),
+             CI = paste0('(', ci95[,1], ' ; ', ci95[,2], ')'),
+             p.value = round(summary(x)$coef[,4], 3)) %>%
+  kable() %>% kable_styling()
+}
+
+summary_ps_tab <- function(x, mod) {
+  if (ncol(mod$fit1_coef_boots) == 3) {
+      ci95 <- rbind(exp(quantile(mod$fit1_coef_boots[,1], probs = c(0.025, 0.975))),
+                exp(quantile(mod$fit1_coef_boots[,2], probs = c(0.025, 0.975))),
+                exp(quantile(mod$fit1_coef_boots[,3], probs = c(0.025, 0.975))))
+  } else {
+      ci95 <- rbind(exp(quantile(mod$fit1_coef_boots[,1], probs = c(0.025, 0.975))),
+                exp(quantile(mod$fit1_coef_boots[,2], probs = c(0.025, 0.975))))
+  }
+  ci95_boots <- round(ci95, 2)
+  ci95_ps    <- round(exp(confint.default(x)), 2)
+  data.frame(OR = round(exp(summary(x)$coef[,1]), 2),
+             #CI_conservative = paste0('(', ci95_ps[,1], ' ; ', ci95_ps[,2], ')'),
+             CI_bootstrap    = paste0('(', ci95_boots[,1], ' ; ', ci95_boots[,2], ')')) %>%
+  kable() %>% kable_styling()
+}
+
+
+
+summary_firth_tab <- function(x, mod) {
+  if (ncol(mod$fit2_coef_boots) == 3) {
+      ci95 <- rbind(exp(quantile(mod$fit2_coef_boots[,1], probs = c(0.025, 0.975))),
+                exp(quantile(mod$fit2_coef_boots[,2], probs = c(0.025, 0.975))),
+                exp(quantile(mod$fit2_coef_boots[,3], probs = c(0.025, 0.975))))
+  } else {
+      ci95 <- rbind(exp(quantile(mod$fit2_coef_boots[,1], probs = c(0.025, 0.975))),
+                exp(quantile(mod$fit2_coef_boots[,2], probs = c(0.025, 0.975))))
+  }
+  ci95_boots <- round(ci95, 2)
+  ci95_ps    <- round(exp(confint.default(x)), 2)
+  data.frame(OR = round(exp(coef(x)), 2),
+             #CI_conservative = paste0('(', ci95_ps[,1], ' ; ', ci95_ps[,2], ')'),
+             CI_bootstrap    = paste0('(', ci95_boots[,1], ' ; ', ci95_boots[,2], ')')) %>%
+  kable() %>% kable_styling()
+}
+```
+
+
+## Overview {.tabset}
+
+### Models
+
+<br>
+
+Four models will be computed for each outcome:
+
+1. Univariable model, adjusting for NAT2 only
+2. Full model, adjusting for all covariates: `r covariates_out`
+3. Propensity score weighted, it is the univariable model weighted by the propensity score
+4. Weighted Logistic regression with firth correction, where the weights are propensity scores
+
+- The propensity score model regresses the exposure NAT2 on the following covariates: `r covariates_ps`.
+  - We used a multinomial model to estimate the propensity score, since NAT2 contains 3 categories: `r levels(dd_final$nat2_cat)`.
+  - Then, the predicted (estimated) propensity score is used as weights in the main outcome regression model.
+  - The goal is avoid overfitting, which may happen if we include all covariates in the main outcome regression model.
+
+**Note 1:**
+
+- For the binary exposure (binary NAT2), we used a logistic regression model to estimate the propensity score.
+- The binary exposure was used because some levels of NAT2 is almost empty, which could lead to difficulties during the estimation process. 
+
+**Note 2:**
+
+- Firth correction was used because some levels of NAT2 are nearly empty.
+- Firth correction is used when there's separation in the data, i.e., when the outcome is separates the exposure perfectly. In our case, some levels of NAT2 is nearly empty, causing a separation and issues with standard logistic regression. Firth correction, although originally created to reduced biases in logistic regression due to small samples, can also be used in such situations. [Here](http://fmwww.bc.edu/RePEc/bocode/f/firthlogit.html) is a reference, related to Stata.
+
+**Note 3:**
+
+- Both the univariable and full model uses Wald-type confidence intervals, which are based on normal approximations. However, when the sample size is small, they may be inaccurate. This is explained in the link above (section **Remarks**)
+- The logistic regression with propensity score weights use Bootstrap with 999 replicates to construct (a quantile) confidence intervals.
+- The logistic regression with firth correction uses the profile likelihood to construct confidence intervals; they may be more accurate (than Wald-type CIs) when the sample size is small.
+
+
+### Table
+
+<br>
+
+Summary data by HIV status (1 = HIV-seropositive, 0 = HIV-seronegative)
+
+```{r}
+B <- 999 ## Bootstrap replicates
+
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$nat2_bin <- as.factor(dd_final_tab$nat2_bin)
+tab0 <- compareGroups(paste0('hiv ~ ', paste(c(exposure, union(c(covariates_out[-1], 'ame', 'hgapct_group'), covariates_ps[-1]), outcomes), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Binary exposure {.tabset}
+
+### Overal AE {.tabset}
+
+#### Outcome: `r outcomes[1]`: {.tabset}
+
+```{r}
+res <- run_mod(i=1, j=1, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+ps_weights_bin <- res$weights_ps$weights
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+dd_final_tab$nat2_bin <- as.factor(dd_final_tab$nat2_bin)
+tab0 <- compareGroups(paste0(outcomes[1], ' ~ ', paste(c(exposure[1], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+
+
+
+#### Outcome: `r outcomes[2]`: {.tabset}
+
+```{r}
+out_i <- 2
+res <- run_mod(i=out_i, j=1, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+dd_final_tab$nat2_bin <- as.factor(dd_final_tab$nat2_bin)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[1], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+
+
+#### Outcome: `r outcomes[3]`: {.tabset}
+
+```{r}
+out_i <- 3
+res <- run_mod(i=out_i, j=1, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out_v2)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+dd_final_tab$nat2_bin <- as.factor(dd_final_tab$nat2_bin)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[1], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+#### Outcome: `r outcomes[4]`: {.tabset}
+
+```{r}
+out_i <- 4
+res <- run_mod(i=out_i, j=1, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+dd_final_tab$nat2_bin <- as.factor(dd_final_tab$nat2_bin)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[1], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+### Hepatic AE {.tabset}
+
+#### Outcome: `r outcomes[5]`: {.tabset}
+
+```{r}
+out_i <- 5
+res <- run_mod(i=out_i, j=1, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+dd_final_tab$nat2_bin <- as.factor(dd_final_tab$nat2_bin)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[1], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+
+#### Outcome: `r outcomes[6]`: {.tabset}
+
+```{r}
+out_i <- 6
+res <- run_mod(i=out_i, j=1, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+dd_final_tab$nat2_bin <- as.factor(dd_final_tab$nat2_bin)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[1], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+#### Outcome: `r outcomes[7]`: {.tabset}
+
+```{r}
+out_i <- 7
+res <- run_mod(i=out_i, j=1, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+dd_final_tab$nat2_bin <- as.factor(dd_final_tab$nat2_bin)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[1], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+
+
+
+
+### Fail/recurrence {.tabset}
+
+#### Outcome: `r outcomes[8]`: {.tabset}
+
+**1=Extensive, 0=Slow/intermediate
+
+```{r}
+out_i <- 8
+dd_final$nat2_bin = ifelse(dd_final$nat2_3lev >= 2, 0, 1)
+res <- run_mod(i=out_i, j=1, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+dd_final_tab$nat2_bin <- as.factor(dd_final_tab$nat2_bin)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[1], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## 3-level exposure {.tabset}
+
+### Overal AE {.tabset}
+
+#### Outcome: `r outcomes[1]`: {.tabset}
+
+```{r}
+res <- run_mod(i=1, j=2, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+tab0 <- compareGroups(paste0(outcomes[1], ' ~ ', paste(c(exposure[2], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+#### Outcome: `r outcomes[2]`: {.tabset}
+
+```{r}
+out_i <- 2
+res <- run_mod(i=out_i, j=2, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+ps_weights_3level <- res$weights_ps$weights
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[2], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+
+
+
+#### Outcome: `r outcomes[3]`: {.tabset}
+
+```{r}
+out_i <- 3
+res <- run_mod(i=out_i, j=2, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out_v2)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[2], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### Outcome: `r outcomes[4]`: {.tabset}
+
+```{r}
+out_i <- 4
+res <- run_mod(i=out_i, j=2, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[2], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+### Hepatic AE {.tabset}
+
+#### Outcome: `r outcomes[5]`: {.tabset}
+
+```{r}
+out_i <- 5
+res <- run_mod(i=out_i, j=2, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[2], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+
+#### Outcome: `r outcomes[6]`: {.tabset}
+
+```{r}
+out_i <- 6
+res <- run_mod(i=out_i, j=2, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[2], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+
+
+#### Outcome: `r outcomes[7]`: {.tabset}
+
+```{r}
+out_i <- 6
+res <- run_mod(i=out_i, j=2, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[2], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+
+
+
+
+### Fail/recurrence {.tabset}
+
+#### Outcome: `r outcomes[8]`: {.tabset}
+
+```{r}
+out_i <- 8
+dd_final$nat2_cat <- relevel(dd_final$nat2_cat, ref='slow')
+res <- run_mod(i=out_i, j=2, data = dd_final, B = B, boots_ci = TRUE,
+               outcomes = outcomes, exposure = exposure,
+               covariates_ps = covariates_ps, covariates_out = covariates_out)
+
+#bal.tab(res$ps_wgts, un=TRUE)
+#bal.tab(res$ps_wgts, stats = c("m"), thresholds = c(m = 0.02))
+```
+
+##### Table
+
+<br>
+
+```{r}
+dd_final_tab <- dd_final
+for (col_i in outcomes)
+  dd_final_tab[,col_i] <- as.character(dd_final_tab[,col_i])  
+dd_final_tab$dot_yesno <- as.factor(dd_final_tab$dot_yesno)
+dd_final_tab$hiv <- as.factor(dd_final_tab$hiv)
+tab0 <- compareGroups(paste0(outcomes[out_i], ' ~ ', paste(c(exposure[2], union(c(covariates_out, 'ame', 'hgapct_group'), covariates_ps)), collapse = ' + ')),
+                      data = dd_final_tab, method = 2)
+tab0 <- createTable(tab0, show.all = TRUE)
+export2md(tab0)
+```
+
+
+
+##### Univariable model
+
+```{r}
+#tab_model(res$mod_null)
+summary_tab(res$mod_null)
+```
+
+##### Full model
+
+**Wald-type interval**
+
+```{r}
+summary_tab(res$mod_all)
+```
+
+**Profile-likelihood type interval**
+
+```{r}
+summary_tab_profile(res$mod_all)
+```
+
+
+##### PS weighted
+
+```{r}
+summary_ps_tab(res$mod_ps, mod=res)
+```
+
+##### PS weighted (Firth correction)
+
+```{r}
+summary_firth_tab(res$mod_firth, mod=res)
+```
+
+
+
+
+```{r}
+write.csv(data.frame(subjid = dd_final$FID, ps_weights_bin=ps_weights_bin, ps_weights_3level=ps_weights_3level),
+          'C:/Users/amorigg1/OneDrive - VUMC/Documents/RePORT/Digna/David_Hass/ps_weights_new.csv', row.names = FALSE)
+```
